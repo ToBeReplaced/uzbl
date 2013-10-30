@@ -1090,6 +1090,8 @@ typedef struct {
 
 static gboolean
 decide_tls_error_policy (GString *result, gpointer data);
+static gchar *
+get_certificate_info (GTlsCertificate *cert);
 
 gboolean
 tls_error_cb (WebKitWebView *view, WebKitCertificateInfo *info, const gchar *host, gpointer data)
@@ -1128,7 +1130,8 @@ tls_error_cb (WebKitWebView *view, WebKitCertificateInfo *info, const gchar *hos
         flags_str = g_string_new ("unknown");
     }
 
-    /* TODO: Get information from the certificate. */
+    GTlsCertificate *cert = webkit_certificate_info_get_tls_certificate (info);
+    gchar *cert_info = get_certificate_info (cert);
 
     uzbl_debug ("TLS Error -> %s\n", host);
 
@@ -1142,6 +1145,7 @@ tls_error_cb (WebKitWebView *view, WebKitCertificateInfo *info, const gchar *hos
     if (tls_error_command) {
         uzbl_commands_args_append (args, g_strdup (host));
         uzbl_commands_args_append (args, g_strdup (flags_str->str));
+        uzbl_commands_args_append (args, g_strdup (cert_info));
         UzblTlsErrorInfo *error_info = g_malloc (sizeof (UzblTlsErrorInfo));
         error_info->info = webkit_certificate_info_copy (info);
         error_info->host = g_strdup (host);
@@ -1152,9 +1156,11 @@ tls_error_cb (WebKitWebView *view, WebKitCertificateInfo *info, const gchar *hos
         uzbl_events_send (TLS_ERROR, NULL,
             TYPE_STR, host,
             TYPE_STR, flags_str,
+            TYPE_STR, cert_info,
             NULL);
     }
 
+    g_free (cert_info);
     g_string_free (flags_str, TRUE);
 
     return TRUE;
@@ -1910,6 +1916,117 @@ decide_tls_error_policy (GString *result, gpointer data)
     g_free (info->host);
     webkit_certificate_info_free (info->info);
     g_free (info);
+}
+
+gchar *
+get_certificate_info (GTlsCertificate *cert)
+{
+    gnutls_x509_crt_t tls_cert = NULL;
+    GString *info = g_string_new ("{ \"uzbl_tls_info_version\": 0");
+
+    /* Parse out the certificate data. */
+    {
+        GByteArray *der_info = NULL;
+        gnutls_datum_t datum;
+
+        g_object_get (G_OBJECT (cert),
+            "certificate", &der_info,
+            NULL);
+        datum.data = der_info->data;
+        datum.size = der_info->len;
+
+        /* Import the certificate into gnutls data structure. */
+        gnutls_x509_crt_init (&tls_cert);
+        gnutls_x509_crt_import (tls_cert, &der_info, GNUTLS_X509_FMT_DER);
+        g_byte_array_unref (der_info);
+    }
+
+    /* Get the certificate version. */
+    {
+        g_string_append_printf (info, ", \"version\": %d",
+            gnutls_x509_crt_get_version (tls_cert));
+    }
+
+    /* Get domain name information. */
+    {
+        gchar *dn_info = NULL;
+        size_t dn_size;
+        gnutls_x509_crt_get_dn (tls_cert, NULL, &dn_size);
+        dn_info = g_malloc (dn_size);
+        gnutls_x509_crt_get_dn (tls_cert, dn_info, &dn_size);
+        g_string_append_printf (info, ", domain: \"%s\"", dn_info);
+        g_free (dn_info);
+    }
+
+    /* Get the algorithm information. */
+    {
+        int algo = gnutls_x509_crt_get_signature_algorithm (cert);
+        const gchar *algo;
+        gboolean secure = FALSE;
+#define tls_sign_algorithm(call)                   \
+    call(GNUTLS_SIGN_RSA_SHA1, "rsa_sha1")         \
+    call(GNUTLS_SIGN_DSA_SHA1, "dsa_sha1")         \
+    call(GNUTLS_SIGN_RSA_MD5, "rsa_md5")           \
+    call(GNUTLS_SIGN_RSA_MD2, "rsa_md2")           \
+    call(GNUTLS_SIGN_RSA_RMD160, "rsa_rmd160")     \
+    call(GNUTLS_SIGN_RSA_SHA256, "rsa_sha256")     \
+    call(GNUTLS_SIGN_RSA_SHA384, "rsa_sha384")     \
+    call(GNUTLS_SIGN_RSA_SHA512, "rsa_sha512")     \
+    call(GNUTLS_SIGN_RSA_SHA224, "rsa_sha224")     \
+    call(GNUTLS_SIGN_DSA_SHA224, "dsa_sha224")     \
+    call(GNUTLS_SIGN_DSA_SHA256, "dsa_sha256")     \
+    call(GNUTLS_SIGN_ECDSA_SHA1, "ecdsa_sha1")     \
+    call(GNUTLS_SIGN_ECDSA_SHA224, "ecdsa_sha224") \
+    call(GNUTLS_SIGN_ECDSA_SHA256, "ecdsa_sha256") \
+    call(GNUTLS_SIGN_ECDSA_SHA384, "ecdsa_sha384") \
+    call(GNUTLS_SIGN_ECDSA_SHA512, "ecdsa_sha512")
+#define CHECK_ALGO(val, str)  \
+    } else if (algo == val) { \
+        algo = str;           \
+        secure = gnutls_sign_is_secure (algo);
+        if (algo < 0) {
+            algo = "error";
+        tls_sign_algorithm (CHECK_ALGO);
+        } else {
+            algo = "unknown";
+        }
+#undef CHECK_ALGO
+#undef tls_sign_algorithm
+
+        g_string_append_printf (info,
+            ", \"algorithm\": \"%s\", \"secure\": %s",
+            algo, secure ? "true" : "false");
+    }
+
+    /* Get the certificate fingerprint. */
+    {
+        const gnutls_digest_algorithm_t algo = GNUTLS_DIG_SHA512;
+        const gchar *algo_name = "sha512";
+        size_t size = gnutls_hash_get_len (algo);
+        gchar *fingerprint = g_malloc (size);
+        gnutls_x509_crt_get_fingerprint (tls_cert, algo, fingerprint, &size);
+        g_string_append_printf (info,
+            "\"fingerprint_digest\": \"%s\", \"fingerprint\": ",
+            algo_name);
+        for (size_t i = 0; i < size; ++i) {
+            g_string_append_printf (info, "%c%x",
+                i ? ':' : '\"', fingerprint[i]);
+        }
+    }
+
+    /* Free the certificate. */
+    gnutls_x509_crt_deinit (tls_cert);
+
+    g_string_append_c (info, '}');
+
+    GTlsCertificate *issuer_cert = g_tls_certificate_get_issuer (cert);
+    if (issuer_cert) {
+        gchar *issuer_info = get_certificate_info (issuer_info);
+        g_string_append_printf (info, ", \"issuer\": %s", issuer_info);
+        g_free (issuer_info);
+    }
+
+    return g_string_free (info, FALSE);
 }
 #endif
 #endif
