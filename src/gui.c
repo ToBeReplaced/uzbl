@@ -227,6 +227,10 @@ download_cb (WebKitWebView *view, WebKitDownload *download, gpointer data);
 #ifdef USE_WEBKIT2
 static void
 permission_cb (WebKitWebView *view, WebKitPermissionRequest *request, gpointer data);
+#if WEBKIT_CHECK_VERSION (2, 3, 1)
+static gboolean
+tls_error_cb (WebKitWebView *view, WebKitCertificateInfo *info, const gchar *host, gpointer data);
+#endif
 #else
 static gboolean
 geolocation_policy_cb (WebKitWebView *view, WebKitWebFrame *frame, WebKitGeolocationPolicyDecision *decision, gpointer data);
@@ -320,6 +324,9 @@ web_view_init ()
 #endif
 #ifdef USE_WEBKIT2
         "signal::permission-request",                   G_CALLBACK (permission_cb),            NULL,
+#if WEBKIT_CHECK_VERSION (2, 3, 1)
+        "signal::load-failed-with-tls-errors",          G_CALLBACK (tls_error_cb),             NULL,
+#endif
 #else
         "signal::geolocation-policy-decision-requested",G_CALLBACK (geolocation_policy_cb),    NULL,
 #endif
@@ -1074,6 +1081,85 @@ permission_cb (WebKitWebView *view, WebKitPermissionRequest *request, gpointer d
 
     return request_permission (uri, type, G_OBJECT (request));
 }
+
+#if WEBKIT_CHECK_VERSION (2, 3, 1)
+typedef struct {
+    WebKitCertificateInfo *info;
+    const gchar *host;
+} UzblTlsErrorInfo;
+
+static gboolean
+decide_tls_error_policy (GString *result, gpointer data);
+
+gboolean
+tls_error_cb (WebKitWebView *view, WebKitCertificateInfo *info, const gchar *host, gpointer data)
+{
+    UZBL_UNUSED (view);
+    UZBL_UNUSED (data);
+
+#define tls_error_flags(call)                              \
+    call(G_TLS_CERTIFICATE_UNKNOWN_CA, "unknown_ca")       \
+    call(G_TLS_CERTIFICATE_BAD_IDENTITY, "bad_identity")   \
+    call(G_TLS_CERTIFICATE_NOT_ACTIVATED, "not_activated") \
+    call(G_TLS_CERTIFICATE_EXPIRED, "expired")             \
+    call(G_TLS_CERTIFICATE_REVOKED, "revoked")             \
+    call(G_TLS_CERTIFICATE_INSECURE, "insecure")           \
+    call(G_TLS_CERTIFICATE_GENERIC_ERROR, "error")
+
+    GString *flags_str = NULL;
+    GTlsCertificateFlags flags = webkit_certificate_info_get_tls_errors (info);
+
+#define CHECK_TLS_FLAG(val, str)                \
+    if (flags & flag) {                         \
+        if (flags_str) {                        \
+            g_string_append_c (flags_str, ','); \
+            g_string_append (flags_str, str);   \
+        } else {                                \
+            flags_str = g_string_new (str);     \
+        }                                       \
+    }
+
+    tls_error_flags (CHECK_TLS_FLAG)
+
+#undef CHECK_TLS_FLAG
+#undef tls_error_flags
+
+    if (!flags_str) {
+        flags_str = g_string_new ("unknown");
+    }
+
+    /* TODO: Get information from the certificate. */
+
+    uzbl_debug ("TLS Error -> %s\n", host);
+
+    gchar *handler = uzbl_variables_get_string ("tls_error_handler");
+
+    GArray *args = uzbl_commands_args_new ();
+    const UzblCommand *tls_error_command = uzbl_commands_parse (handler, args);
+
+    g_free (handler);
+
+    if (tls_error_command) {
+        uzbl_commands_args_append (args, g_strdup (host));
+        uzbl_commands_args_append (args, g_strdup (flags_str->str));
+        UzblTlsErrorInfo *error_info = g_malloc (sizeof (UzblTlsErrorInfo));
+        error_info->info = webkit_certificate_info_copy (info);
+        error_info->host = g_strdup (host);
+        uzbl_io_schedule_command (tls_error_command, args, decide_tls_error_policy, error_info);
+    } else {
+        uzbl_commands_args_free (args);
+
+        uzbl_events_send (TLS_ERROR, NULL,
+            TYPE_STR, host,
+            TYPE_STR, flags_str,
+            NULL);
+    }
+
+    g_string_free (flags_str, TRUE);
+
+    return TRUE;
+}
+#endif
 #else
 gboolean
 geolocation_policy_cb (WebKitWebView *view, WebKitWebFrame *frame, WebKitGeolocationPolicyDecision *decision, gpointer data)
@@ -1808,6 +1894,25 @@ request_permission (const gchar *uri, const gchar *type, GObject *obj)
 
     return TRUE;
 }
+
+#ifdef USE_WEBKIT2
+#if WEBKIT_CHECK_VERSION (2, 3, 1)
+void
+decide_tls_error_policy (GString *result, gpointer data)
+{
+    UzblTlsErrorInfo *info = (UzblTlsErrorInfo *)data;
+
+    if (!g_strcmp0 (result->str, "ALLOW")) {
+        WebKitWebContext *ctx = webkit_web_view_get_context (uzbl.gui.web_view);
+        webkit_web_context_allow_tls_certificate_for_host (context, info->info, info->host);
+    }
+
+    g_free (info->host);
+    webkit_certificate_info_free (info->info);
+    g_free (info);
+}
+#endif
+#endif
 
 static void
 create_web_view_uri_cb (WebKitWebView *view, GParamSpec param_spec, gpointer data);
