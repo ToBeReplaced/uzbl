@@ -1167,6 +1167,11 @@ DECLARE_GETSET (int, run_insecure_content);
 /* TODO: For WebKit2, we'll have to manage the BackForwardList manually. */
 DECLARE_SETTER (int, maintain_history);
 #endif
+#ifdef USE_WEBKIT2
+#if WEBKIT_CHECK_VERSION (2, 3, 2)
+DECLARE_GETSET (int, enable_credential_storage);
+#endif
+#endif
 
 /* Inspector variables */
 #ifndef USE_WEBKIT2
@@ -1523,6 +1528,11 @@ uzbl_variables_private_new (GHashTable *table)
         { "run_insecure_content",         UZBL_V_FUNC (run_insecure_content,                   INT)},
 #endif
         { "maintain_history",             UZBL_V_INT (priv->maintain_history,                  set_maintain_history)},
+#endif
+#ifdef USE_WEBKIT2
+#if WEBKIT_CHECK_VERSION (2, 3, 2)
+        { "enable_credential_storage",    UZBL_V_FUNC (enable_credential_storage,              INT)},
+#endif
 #endif
 
         /* Inspector variables */
@@ -2312,6 +2322,22 @@ IMPLEMENT_SETTER (int, maintain_history)
 
     return TRUE;
 }
+#endif
+
+#ifdef USE_WEBKIT2
+#if WEBKIT_CHECK_VERSION (2, 3, 2)
+IMPLEMENT_GETTER (int, enable_credential_storage)
+{
+    WebKitWebContext *context = webkit_web_view_get_context (uzbl.gui.web_view);
+    return webkit_web_context_get_persistent_storage_enabled (context);
+}
+
+IMPLEMENT_SETTER (int, enable_credential_storage)
+{
+    WebKitWebContext *context = webkit_web_view_get_context (uzbl.gui.web_view);
+    return webkit_web_context_set_persistent_storage_enabled (context, enable_credential_storage);
+}
+#endif
 #endif
 
 /* Inspector variables */
