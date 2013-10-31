@@ -243,6 +243,7 @@ uzbl_free ()
     uzbl_requests_free ();
     uzbl_commands_free ();
     uzbl_variables_free ();
+    uzbl_em_free ();
     uzbl_io_free ();
 }
 
